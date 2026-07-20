@@ -43,7 +43,7 @@ export async function buildInventory(octokit: Octokit, opts: InventoryOpts): Pro
   const reports: RepoReport[] = [];
   for (const repo of repos) {
     // No default branch means an empty repo — skip rather than guess a branch name.
-    if (repo.archived || repo.disabled || repo.fork || !repo.default_branch) continue;
+    if (repo.archived || repo.disabled || !repo.default_branch) continue;
     if (!repo.pushed_at || new Date(repo.pushed_at) < cutoff) continue;
     reports.push(await inspectRepo(octokit, opts.org, repo.name, repo.default_branch, repo.pushed_at));
   }
