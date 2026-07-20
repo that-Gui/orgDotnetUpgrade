@@ -15,7 +15,7 @@ CLI that inventories an organization's GitHub repositories for projects targetin
 |---|---|---|---|
 | `GITHUB_ORG` | yes | — | Organization to scan |
 | `GITHUB_TOKEN` | yes | — | Auth for API, clone, and push |
-| `WORK_DIR` | no | `./work` | Clones and per-repo Claude logs |
+| `WORK_DIR` | no | `./work` | Clones (`repos/`) and per-repo Claude logs (`logs/`) |
 | `BATCH_SIZE` | no | `3` | Repos upgraded per `run` |
 | `ACTIVE_MONTHS` | no | `12` | Repos pushed within this window count as active |
 | `CLAUDE_TIMEOUT_MINUTES` | no | `90` | Per-repo Claude timeout |
@@ -59,7 +59,29 @@ so the token it sits next to should reach nothing beyond the org being upgraded.
 In CI, take `GITHUB_TOKEN` from the runner's secret store, or mint a short-lived
 GitHub App installation token per run, rather than a long-lived PAT.
 
-`run` exits 0 only if every repo in the batch produced a PR. A repo whose loop does not conclusively succeed (no `UPGRADE_RESULT: SUCCESS` marker, timeout, non-zero exit, or no change outside build artifacts) produces no commit, branch, or PR — only `WORK_DIR/<repo>.claude.log` (failures before the loop runs, e.g. a failed clone, produce no log).
+`run` exits 0 only if every repo in the batch produced a PR. A repo whose loop does not conclusively succeed (no `UPGRADE_RESULT: SUCCESS` marker, timeout, non-zero exit, no change outside build artifacts, or a staged path under `.github/`, `.claude/`, `.env*`, `.gitattributes`) produces no commit, branch, or PR — only `WORK_DIR/logs/<repo>.log` (failures before the loop runs, e.g. a failed clone, produce no log).
 
-Self-checks: `npx tsx src/inventory.ts` (classifier) and `npx tsx src/upgrade.ts`
-(success gate, token withholding, and PR-body quoting).
+`WORK_DIR` must be a directory of its own: the per-repo clone is deleted and recreated
+on every run, so pointing it at the cwd or `$HOME` is refused rather than obeyed.
+
+Repos whose scan is incomplete (truncated git tree, more or larger project files than
+the fetch caps) are reported as `Excluded — incomplete scan` and never queued: partial
+evidence can hide a `net472` project and make a repo look like a clean upgrade candidate.
+
+## Isolation
+
+The agent runs the target repo's own build, so it executes untrusted code. The token is
+withheld from its environment by value, git runs credential-free except for `clone` and
+`push`, and the clone's `.git/config` and hooks are restored before any git call that
+follows the agent — so a repo-planted hook, `filter.*.clean`, or `url.*.insteadOf` can
+neither run under our credential nor redirect the push.
+
+What that does **not** cover: the agent runs as the same uid as this process, so it can
+still read the parent's environment (`/proc/<ppid>/environ`), `~/.git-credentials`,
+`~/.netrc`, and any `.env` above `WORK_DIR`. Keep `WORK_DIR` outside the directory
+holding your `.env`, and run the whole thing in a container or under a dedicated uid if
+the org's repos are not all trusted.
+
+Self-checks: `npx tsx src/inventory.ts` (classifier, parse bounds, queue gate) and
+`npx tsx src/upgrade.ts` (success gate, token withholding and redaction, staged-path
+gates, PR-body quoting, and a live check that git runs no repo-planted hook).

@@ -6,7 +6,14 @@ export type RepoReport = {
   name: string;
   defaultBranch: string;
   pushedAt: string;
-  classification: "needs-upgrade" | "up-to-date" | "framework" | "netstandard-only" | "no-dotnet";
+  classification:
+    | "needs-upgrade"
+    | "up-to-date"
+    | "framework"
+    | "netstandard-only"
+    | "no-dotnet"
+    /** Evidence was incomplete (truncated tree, too many or too large project files). Never queued. */
+    | "incomplete";
   tfms: string[];
   sdkVersion?: string;
   projectFileCount: number;
@@ -18,6 +25,12 @@ const PROJECT_FILE = /\.(cs|fs|vb)proj$/i;
 const SPECIAL_FILE = /(^|\/)(Directory\.Build\.props|global\.json)$/i;
 const isInteresting = (p: string) => PROJECT_FILE.test(p) || SPECIAL_FILE.test(p);
 const MAX_FETCHES_PER_REPO = 30;
+// getContent serves blobs up to 100 MB and we fetch 30 concurrently; without a cap one repo of
+// padded .csproj files OOMs the scan. Real project files are kilobytes.
+const MAX_FILE_BYTES = 1_000_000;
+// The TFM regex is quadratic on input like "<TargetFramework ".repeat(n) with no closing ">".
+// The size cap above already bounds it; this bounds it to milliseconds.
+const MAX_PARSE_CHARS = 200_000;
 
 export async function buildInventory(octokit: Octokit, opts: InventoryOpts): Promise<RepoReport[]> {
   // Day 1 before the shift: setMonth() on a 31st rolls forward into the wrong month
@@ -52,13 +65,17 @@ async function inspectRepo(
 ): Promise<RepoReport> {
   let paths: string[] = [];
   let projectFileCount = 0;
+  let incomplete = false;
   try {
     const { data } = await octokit.git.getTree({ owner: org, repo: name, tree_sha: defaultBranch, recursive: "1" });
-    // ponytail: no "unknown" bucket in the TODO's classification set, so a truncated tree warns instead of reclassifying
     if (data.truncated) console.error(`warning: ${name}: git tree truncated; classification may be incomplete`);
-    const blobPaths = data.tree.filter((e) => e.type === "blob").map((e) => e.path ?? "");
-    projectFileCount = blobPaths.filter((p) => PROJECT_FILE.test(p)).length;
-    paths = blobPaths.filter(isInteresting).slice(0, MAX_FETCHES_PER_REPO);
+    const blobs = data.tree.filter((e) => e.type === "blob");
+    projectFileCount = blobs.filter((e) => PROJECT_FILE.test(e.path ?? "")).length;
+    const interesting = blobs.filter((e) => isInteresting(e.path ?? ""));
+    const readable = interesting.filter((e) => (e.size ?? 0) <= MAX_FILE_BYTES);
+    paths = readable.map((e) => e.path ?? "").slice(0, MAX_FETCHES_PER_REPO);
+    // Any evidence we did not actually read makes the verdict a guess: see the classification below.
+    incomplete = Boolean(data.truncated) || readable.length < interesting.length || paths.length < readable.length;
   } catch (e) {
     // 409 empty repo / 404 unreadable ref: genuinely no project files. Anything else (auth, rate limit) must surface.
     const status = (e as { status?: number }).status;
@@ -70,11 +87,13 @@ async function inspectRepo(
   const texts = await Promise.all(paths.map((p) => fetchText(octokit, org, name, p, defaultBranch)));
   // Parse in path order so "last global.json wins" stays deterministic.
   for (const [i, p] of paths.entries()) {
-    const text = texts[i];
+    const text = texts[i]?.slice(0, MAX_PARSE_CHARS);
     if (text === undefined) continue;
     if (/global\.json$/i.test(p)) {
       try {
-        sdkVersion = JSON.parse(text)?.sdk?.version ?? sdkVersion;
+        // JSON.parse yields anything; sdkVersion is typed string and gets printed and parseInt'd.
+        const v = JSON.parse(text)?.sdk?.version;
+        if (typeof v === "string") sdkVersion = v;
       } catch {
         // malformed global.json: ignore
       }
@@ -85,11 +104,16 @@ async function inspectRepo(
     }
   }
 
+  const classification = classify(tfms, sdkVersion);
   return {
     name,
     defaultBranch,
     pushedAt,
-    classification: classify(tfms, sdkVersion),
+    // Partial evidence must not reach the write path. A repo whose net472 projects fell outside the
+    // fetched slice looks exactly like a clean net8.0 upgrade candidate — and padding a repo with
+    // junk files to push the real TFMs past the cap is a cheap way to aim the agent at it.
+    // Only the upgrade verdict is withheld; "up-to-date" and the excluded buckets are safe to keep.
+    classification: incomplete && classification === "needs-upgrade" ? "incomplete" : classification,
     tfms: [...new Set(tfms)],
     sdkVersion,
     projectFileCount,
@@ -143,5 +167,20 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   for (const [tfms, sdk, want] of cases) {
     assert.strictEqual(classify(tfms, sdk), want, `classify(${JSON.stringify(tfms)}, ${JSON.stringify(sdk)})`);
   }
-  console.log(`classification self-check: ${cases.length}/${cases.length} cases pass`);
+
+  // The TFM regex must not blow up on a padded project file — the cap keeps this well under a second.
+  const started = Date.now();
+  const hostile = "<TargetFramework ".repeat(MAX_PARSE_CHARS).slice(0, MAX_PARSE_CHARS);
+  assert.strictEqual([...hostile.matchAll(/<TargetFrameworks?(?:\s[^>]*)?>([^<]+)<\/TargetFrameworks?>/gi)].length, 0);
+  assert.ok(Date.now() - started < 5_000, "TFM parse must stay bounded on hostile input");
+
+  // Incomplete evidence must never produce a queued repo.
+  const queued = upgradeQueue([
+    { name: "a", defaultBranch: "main", pushedAt: "", classification: "needs-upgrade", tfms: [], projectFileCount: 1 },
+    { name: "b", defaultBranch: "main", pushedAt: "", classification: "incomplete", tfms: [], projectFileCount: 1 },
+  ]);
+  assert.deepStrictEqual(queued.map((r) => r.name), ["a"], "incomplete repos must not be queued");
+
+  const checks = cases.length + 3;
+  console.log(`classification self-check: ${checks}/${checks} cases pass`);
 }

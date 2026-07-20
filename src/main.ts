@@ -2,7 +2,7 @@ import { retry } from "@octokit/plugin-retry";
 import { throttling } from "@octokit/plugin-throttling";
 import { Octokit } from "@octokit/rest";
 import { buildInventory, upgradeQueue, type RepoReport } from "./inventory";
-import { upgradeRepo, type UpgradeConfig } from "./upgrade";
+import { redact, upgradeRepo, type UpgradeConfig } from "./upgrade";
 
 const sub = process.argv[2];
 if (sub !== "inventory" && sub !== "run") {
@@ -11,7 +11,7 @@ if (sub !== "inventory" && sub !== "run") {
 }
 
 function requireEnv(name: string): string {
-  const v = process.env[name];
+  const v = process.env[name]?.trim();
   if (!v) {
     console.error(`missing required env var ${name}`);
     process.exit(1);
@@ -19,18 +19,28 @@ function requireEnv(name: string): string {
   return v;
 }
 
-function numEnv(name: string, fallback: number): number {
-  const raw = process.env[name];
+// `min` defaults to 1: every one of these knobs counts something, and 0 is never the value an
+// operator means. CLAUDE_TIMEOUT_MINUTES=0 is the dangerous one — spawnSync reads timeout:0 as
+// "no timeout" and would run the agent on untrusted code forever. BATCH_SIZE=0 is the quiet one:
+// it reports "0/0 PRs opened" and exits 0, so a misconfigured CI job looks like a clean success.
+function numEnv(name: string, fallback: number, min = 1): number {
+  const raw = process.env[name]?.trim();
   if (!raw) return fallback;
   const n = Number(raw);
-  if (!Number.isFinite(n) || n < 0) {
-    console.error(`invalid ${name}: ${raw} (expected a non-negative number)`);
+  if (!Number.isInteger(n) || n < min) {
+    console.error(`invalid ${name}: ${raw} (expected an integer >= ${min})`);
     process.exit(1);
   }
   return n;
 }
 
 const org = requireEnv("GITHUB_ORG");
+// Interpolated into a clone URL and into API paths. GitHub's own charset for logins; catching a
+// stray quote or newline from a hand-edited .env here beats failing deep inside git.
+if (!/^[A-Za-z0-9-]+$/.test(org)) {
+  console.error(`invalid GITHUB_ORG: ${JSON.stringify(org)}`);
+  process.exit(1);
+}
 const token = requireEnv("GITHUB_TOKEN");
 const activeMonths = numEnv("ACTIVE_MONTHS", 12);
 
@@ -67,6 +77,7 @@ async function main(): Promise<number> {
       reports.filter((r) => r.classification === c).map((r) => r.name).join(", ") || "(none)";
     console.log(`Excluded — .NET Framework: ${names("framework")}`);
     console.log(`Excluded — netstandard-only: ${names("netstandard-only")}`);
+    console.log(`Excluded — incomplete scan: ${names("incomplete")}`);
     return 0;
   }
 
@@ -74,7 +85,9 @@ async function main(): Promise<number> {
   const config: UpgradeConfig = {
     org,
     token,
-    workDir: process.env.WORK_DIR ?? "./work",
+    // `||` not `??`: WORK_DIR= in a .env is an empty string, which resolves to the process cwd and
+    // would point the clone-and-rm-rf at this repo. upgradeRepo re-checks the resolved path.
+    workDir: process.env.WORK_DIR?.trim() || "./work",
     timeoutMinutes: numEnv("CLAUDE_TIMEOUT_MINUTES", 90),
     loopConfigDir: process.env.LOOP_CONFIG_DIR,
   };
@@ -95,12 +108,14 @@ async function main(): Promise<number> {
   return ok === batch.length ? 0 : 1;
 }
 
-main().then(
-  (code) => process.exit(code),
-  (e) => {
-    const message = e instanceof Error ? e.stack ?? e.message : String(e);
-    // Keep in sync with redact() in upgrade.ts (module-internal there per the export contract).
-    console.error(message.replaceAll(token, "***"));
-    process.exit(1);
-  },
-);
+const die = (e: unknown) => {
+  const message = e instanceof Error ? e.stack ?? e.message : String(e);
+  console.error(redact(message, token));
+  process.exit(1);
+};
+// Anything escaping main()'s promise chain — an octokit socket error, a throw inside a throttle
+// hook — would otherwise print Node's default unredacted stack, token and all.
+process.on("unhandledRejection", die);
+process.on("uncaughtException", die);
+
+main().then((code) => process.exit(code), die);
