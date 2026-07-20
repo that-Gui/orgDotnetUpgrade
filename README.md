@@ -23,13 +23,17 @@ CLI that inventories an organization's GitHub repositories for projects targetin
 
 ## Usage
 
+Both scripts load a gitignored `.env` from the repo root if one is present, so put
+`GITHUB_ORG` and `GITHUB_TOKEN` there rather than re-exporting them each shell:
+
+```sh
+# .env — gitignored, never committed
+GITHUB_ORG=my-org
+GITHUB_TOKEN=github_pat_...
+```
+
 ```sh
 npm install
-
-# Read the token from a secret store — never inline it on the command line, which
-# would write a live org write-token into your shell history.
-export GITHUB_ORG=my-org
-export GITHUB_TOKEN=$(op read op://vault/dotnet10-upgrader/token)
 
 # Read-only dry run: print the upgrade queue and excluded repos.
 npm run inventory
@@ -38,16 +42,22 @@ npm run inventory
 npm run run
 ```
 
+A real environment variable always wins over the `.env` entry of the same name, so
+CI secrets are never shadowed by a file left on the runner. If you prefer not to
+keep the token on disk at all, export it instead — read it from a secret store
+rather than inlining it, which would write a live org write-token into your shell
+history:
+
+```sh
+export GITHUB_TOKEN=$(op read op://vault/dotnet10-upgrader/token)
+```
+
 Use the fine-grained PAT or GitHub App token from the prerequisites above — not
 `gh auth token`, which hands over your personal token with every scope you hold
 across every org you belong to. The upgrade loop runs the target repo's own build,
 so the token it sits next to should reach nothing beyond the org being upgraded.
 In CI, take `GITHUB_TOKEN` from the runner's secret store, or mint a short-lived
 GitHub App installation token per run, rather than a long-lived PAT.
-
-`.env` and `.env.*` are gitignored, but nothing in this project reads them — load
-one yourself if you want it, e.g. `set -a; . ./.env; set +a` or a `.envrc`
-containing `dotenv` for direnv.
 
 `run` exits 0 only if every repo in the batch produced a PR. A repo whose loop does not conclusively succeed (no `UPGRADE_RESULT: SUCCESS` marker, timeout, non-zero exit, or no change outside build artifacts) produces no commit, branch, or PR — only `WORK_DIR/<repo>.claude.log` (failures before the loop runs, e.g. a failed clone, produce no log).
 

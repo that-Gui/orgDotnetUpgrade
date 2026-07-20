@@ -4,11 +4,11 @@
   "private": true,
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=24.18.0"
   },
   "scripts": {
-    "inventory": "tsx src/main.ts inventory",
-    "run": "tsx src/main.ts run"
+    "inventory": "tsx --env-file-if-exists=.env src/main.ts inventory",
+    "run": "tsx --env-file-if-exists=.env src/main.ts run"
   },
   "dependencies": {
     "@octokit/plugin-retry": "^7.2.1",
