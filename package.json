@@ -11,6 +11,8 @@
     "run": "tsx src/main.ts run"
   },
   "dependencies": {
+    "@octokit/plugin-retry": "^7.2.1",
+    "@octokit/plugin-throttling": "^9.6.1",
     "@octokit/rest": "^21.1.1"
   },
   "devDependencies": {

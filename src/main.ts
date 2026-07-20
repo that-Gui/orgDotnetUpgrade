@@ -1,3 +1,5 @@
+import { retry } from "@octokit/plugin-retry";
+import { throttling } from "@octokit/plugin-throttling";
 import { Octokit } from "@octokit/rest";
 import { buildInventory, upgradeQueue, type RepoReport } from "./inventory";
 import { upgradeRepo, type UpgradeConfig } from "./upgrade";
@@ -32,7 +34,24 @@ const org = requireEnv("GITHUB_ORG");
 const token = requireEnv("GITHUB_TOKEN");
 const activeMonths = numEnv("ACTIVE_MONTHS", 12);
 
-const octokit = new Octokit({ auth: token });
+// A full-org scan is one getTree plus up to 30 getContent per repo, so a few hundred repos will
+// trip GitHub's secondary rate limit. Without these plugins the 403 propagates out of
+// buildInventory and kills the whole run mid-scan; with them it waits and resumes.
+const ThrottledOctokit = Octokit.plugin(retry, throttling);
+const retryLimit = 3;
+const octokit = new ThrottledOctokit({
+  auth: token,
+  throttle: {
+    onRateLimit: (retryAfter, opts, _octokit, retryCount) => {
+      console.error(`rate limit on ${opts.method} ${opts.url}; retry ${retryCount + 1} in ${retryAfter}s`);
+      return retryCount < retryLimit;
+    },
+    onSecondaryRateLimit: (retryAfter, opts, _octokit, retryCount) => {
+      console.error(`secondary rate limit on ${opts.method} ${opts.url}; retry ${retryCount + 1} in ${retryAfter}s`);
+      return retryCount < retryLimit;
+    },
+  },
+});
 
 async function main(): Promise<number> {
   const reports = await buildInventory(octokit, { org, activeMonths });

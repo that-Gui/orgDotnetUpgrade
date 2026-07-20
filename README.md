@@ -26,13 +26,30 @@ CLI that inventories an organization's GitHub repositories for projects targetin
 ```sh
 npm install
 
+# Read the token from a secret store — never inline it on the command line, which
+# would write a live org write-token into your shell history.
+export GITHUB_ORG=my-org
+export GITHUB_TOKEN=$(op read op://vault/dotnet10-upgrader/token)
+
 # Read-only dry run: print the upgrade queue and excluded repos.
-GITHUB_ORG=my-org GITHUB_TOKEN=ghp_... npm run inventory
+npm run inventory
 
 # Upgrade the first BATCH_SIZE queue repos sequentially and open PRs.
-GITHUB_ORG=my-org GITHUB_TOKEN=ghp_... npm run run
+npm run run
 ```
 
-`run` exits 0 only if every repo in the batch produced a PR. A repo whose loop does not conclusively succeed (no `UPGRADE_RESULT: SUCCESS` marker, timeout, non-zero exit, or empty diff) produces no commit, branch, or PR — only `WORK_DIR/<repo>.claude.log` (failures before the loop runs, e.g. a failed clone, produce no log).
+Use the fine-grained PAT or GitHub App token from the prerequisites above — not
+`gh auth token`, which hands over your personal token with every scope you hold
+across every org you belong to. The upgrade loop runs the target repo's own build,
+so the token it sits next to should reach nothing beyond the org being upgraded.
+In CI, take `GITHUB_TOKEN` from the runner's secret store, or mint a short-lived
+GitHub App installation token per run, rather than a long-lived PAT.
 
-Classifier self-check: `npx tsx src/inventory.ts`
+`.env` and `.env.*` are gitignored, but nothing in this project reads them — load
+one yourself if you want it, e.g. `set -a; . ./.env; set +a` or a `.envrc`
+containing `dotenv` for direnv.
+
+`run` exits 0 only if every repo in the batch produced a PR. A repo whose loop does not conclusively succeed (no `UPGRADE_RESULT: SUCCESS` marker, timeout, non-zero exit, or no change outside build artifacts) produces no commit, branch, or PR — only `WORK_DIR/<repo>.claude.log` (failures before the loop runs, e.g. a failed clone, produce no log).
+
+Self-checks: `npx tsx src/inventory.ts` (classifier) and `npx tsx src/upgrade.ts`
+(success gate, token withholding, and PR-body quoting).

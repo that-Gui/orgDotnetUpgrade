@@ -20,7 +20,10 @@ const isInteresting = (p: string) => PROJECT_FILE.test(p) || SPECIAL_FILE.test(p
 const MAX_FETCHES_PER_REPO = 30;
 
 export async function buildInventory(octokit: Octokit, opts: InventoryOpts): Promise<RepoReport[]> {
+  // Day 1 before the shift: setMonth() on a 31st rolls forward into the wrong month
+  // (Mar 31 minus 1 month lands on Mar 3). Erring wider never drops an active repo.
   const cutoff = new Date();
+  cutoff.setDate(1);
   cutoff.setMonth(cutoff.getMonth() - opts.activeMonths);
   const repos = await octokit.paginate(octokit.repos.listForOrg, { org: opts.org, per_page: 100 });
   // Sequential per repo; inspectRepo's own Promise.all already parallelizes the ≤31 fetches within one.
