@@ -333,7 +333,37 @@ function prBody(summary: string, token: string): string {
   // merge, or @-mention half the org. The fence must outrun the longest backtick run inside it.
   const longest = Math.max(0, ...[...clipped.matchAll(/`+/g)].map((m) => m[0].length));
   const fence = "`".repeat(Math.max(3, longest + 1));
-  return `${PR_PREAMBLE}\n\n<details>\n<summary>Agent run summary</summary>\n\n${fence}text\n${clipped}\n${fence}\n\n</details>`;
+  const details = `<details>\n<summary>Agent run summary</summary>\n\n${fence}text\n${clipped}\n${fence}\n\n</details>`;
+  // The operator's PR template. Every line below is a constant we control; the ONLY untrusted value is
+  // `clipped`, sealed inside the fenced <details> above. Nothing agent-derived reaches a header, a
+  // checklist item, or any unfenced position where it could inject markup, autolink, or mention.
+  return [
+    "## [Dotnet upgrade agent workflow.]()",
+    "",
+    PR_PREAMBLE,
+    "",
+    "### `    Describe this PR    `",
+    "",
+    "Automated upgrade of this repository to .NET 10 (LTS), opened by the dotnet10-upgrader loop.",
+    "",
+    "### `    What is the problem we're trying to solve?    `",
+    "",
+    "This repository targeted a .NET release older than .NET 10 (LTS); this PR moves it onto the current LTS so it stays in support.",
+    "",
+    "### `    What changes have we introduced?    `",
+    "",
+    "Target frameworks (and `global.json`, if present) moved to `net10.0`, NuGet references updated to net10.0-compatible stable versions, and the resulting build/test breaks fixed. `dotnet build` and `dotnet test` both pass — the loop opens no PR otherwise. The agent's full run summary (untrusted repo output, quoted verbatim):",
+    "",
+    details,
+    "",
+    "#### `    Checklist    `",
+    "",
+    "- [ ] Code pipeline builds correctly",
+    "",
+    "### `    Follow up actions after merging PR    `",
+    "",
+    "None.",
+  ].join("\n");
 }
 
 // Self-check for the gates standing between a failed or hostile upgrade and an opened PR:
@@ -376,6 +406,23 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   assert.ok(/```text\n/.test(body), "summary must be fenced");
   assert.ok(prBody("a ``` b", secret).includes("````text"), "fence must outrun backticks in the summary");
   assert.strictEqual(redact("abc", ""), "abc", "empty token must not shred the text");
+
+  // The body follows the operator's PR template: a normal run must emit every section, and the
+  // untrusted summary stays sealed in the fenced <details> (the hostile case above proves that).
+  const templated = prBody("done\nUPGRADE_RESULT: SUCCESS", secret);
+  for (const marker of [
+    "## [Dotnet upgrade agent workflow.]()",
+    "### `    Describe this PR    `",
+    "### `    What is the problem we're trying to solve?    `",
+    "### `    What changes have we introduced?    `",
+    "#### `    Checklist    `",
+    "### `    Follow up actions after merging PR    `",
+  ]) {
+    assert.ok(templated.includes(marker), `PR body must contain section: ${marker}`);
+  }
+  // The template scaffolding sits OUTSIDE the untrusted summary: hostile mentions/links land inside
+  // the fenced <details>, never in the checklist or follow-up that render as live markdown.
+  assert.ok(!body.split("</details>").at(-1)?.includes("@octocat"), "no untrusted text past the sealed <details>");
 
   // The credential git actually transmits is the base64 form; redacting only the raw token leaks it.
   const basic = Buffer.from(`x-access-token:${secret}`).toString("base64");
@@ -421,6 +468,7 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 
-  const checks = cases.length + 25;
-  console.log(`upgrade self-check: ${checks}/${checks} cases pass`);
+  // No hand-maintained tally: node:assert halts the process on the first failure, so reaching this
+  // line already means every case above passed.
+  console.log("upgrade self-check: all cases pass");
 }
