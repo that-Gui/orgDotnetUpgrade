@@ -59,7 +59,13 @@ so the token it sits next to should reach nothing beyond the org being upgraded.
 In CI, take `GITHUB_TOKEN` from the runner's secret store, or mint a short-lived
 GitHub App installation token per run, rather than a long-lived PAT.
 
-`run` exits 0 only if every repo in the batch produced a PR. A repo whose loop does not conclusively succeed (no `UPGRADE_RESULT: SUCCESS` marker, timeout, non-zero exit, no change outside build artifacts, or a staged path under `.github/`, `.claude/`, `.env*`, `.gitattributes`) produces no commit, branch, or PR — only `WORK_DIR/logs/<repo>.log` (failures before the loop runs, e.g. a failed clone, produce no log).
+`run` exits 0 only if every repo in the batch produced a PR. A repo whose loop does not conclusively succeed (an incomplete `BASELINE_FAILURES` / `REVIEWERS: PASS` / `UPGRADE_RESULT: SUCCESS` marker block, timeout, non-zero exit, no change outside build artifacts, or a staged path under `.github/`, `.claude/`, `.env*`, `.gitattributes`) produces no commit, branch, or PR — only `WORK_DIR/logs/<repo>.log` (failures before the loop runs, e.g. a failed clone, produce no log).
+
+The test bar is **no regression**, not a green suite. The agent runs `dotnet build` and `dotnet test` before its first edit to establish a baseline, and a PR opens only if the build passes and every test still failing was already failing then. Tests that were already red may stay red; a test that was passing and now fails blocks the PR. The count is reported as `BASELINE_FAILURES: <n>`, and any non-zero count is stated on the face of the PR with a checklist item to confirm it against the base branch.
+
+The baseline is the agent's own claim — the orchestrator does not run the suite itself. What makes it checkable: the baseline must be captured *before* the first edit (never reconstructed later by stashing), every carried-forward failure must be named in the summary, and `WORK_DIR/logs/<repo>.log` holds the verbatim transcript, so the ordering and the named tests can be audited against the base branch's own CI.
+
+`REVIEWERS: PASS` is a gate in its own right: both `impl-loop` reviewers must return PASS with zero Criticals. `UPGRADE_RESULT` reports only build and tests, so without it a loop that exhausts the 4-round cap with unresolved Critical findings would still open a PR on a green build.
 
 `WORK_DIR` must be a directory of its own: the per-repo clone is deleted and recreated
 on every run, so pointing it at the cwd or `$HOME` is refused rather than obeyed.

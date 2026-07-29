@@ -25,9 +25,12 @@ export type UpgradeOutcome = {
 
 const COMMIT_MESSAGE = "chore: upgrade to .NET 10 (LTS)";
 const COMMIT_IDENTITY = { name: "dotnet10-upgrader", email: "dotnet10-upgrader@users.noreply.github.com" };
+// "Verify that CI is green" was true when a green suite was the bar. It no longer is: a PR may
+// carry failures that pre-date the upgrade, and telling the operator to expect green would read as
+// the loop having lied. Check CI against what the body claims instead.
 const PR_PREAMBLE =
   "This pull request was produced by the automated dotnet10-upgrader loop (Claude Code `impl-loop`). " +
-  "Verify that CI is green and review the diff before merging.";
+  "Review the diff and check CI against the test status stated below before merging.";
 // GitHub's PR body limit is 65536 characters; leave headroom for the preamble and markup.
 const MAX_SUMMARY_CHARS = 60_000;
 // A clone or push against a wedged remote otherwise blocks the whole run forever.
@@ -50,12 +53,18 @@ const ARTIFACT_PATH = new RegExp(`(^|/)(${ARTIFACT_DIRS.join("|")})/|\\.binlog$`
 const FORBIDDEN_PATH = /(^|\/)(\.github|\.claude)\/|(^|\/)(\.gitattributes|\.gitmodules)$|(^|\/)\.env(\.|$)/;
 
 const PLAYBOOK = `Upgrade this repository to .NET 10 (LTS).
+- FIRST, before you edit anything: run 'dotnet build', then 'dotnet test', on the repository exactly as you found it, and record the fully-qualified name of every failing test. That is the BASELINE. Capture it before your first edit — do not reconstruct it afterwards by stashing your changes.
 - Update global.json (if present) and every <TargetFramework>/<TargetFrameworks> value to net10.0, preserving OS-specific suffixes (e.g. net8.0-windows becomes net10.0-windows).
 - Update NuGet package references to stable versions compatible with net10.0.
 - Fix any resulting build or test breaks, including Dockerfile base images and SDK version pins.
-- Both 'dotnet build' and 'dotnet test' must pass.
+- 'dotnet build' must pass. Then re-run 'dotnet test': every test still failing must already be in the baseline. A test that passed in the baseline and fails now is a regression — fix it. Tests that were already failing may stay failing.
+- If the baseline build did not succeed there is no usable baseline, and the strict bar applies instead: both 'dotnet build' and 'dotnet test' must pass outright.
 - Make no changes unrelated to the upgrade.
-- End your final summary with exactly one line: UPGRADE_RESULT: SUCCESS if build and tests pass, or UPGRADE_RESULT: FAILED otherwise.`;
+- In your summary, name every baseline failure you are carrying forward and why it fails, so a human can check the claim against the base branch.
+- End your final summary with exactly these three lines, in this order, with nothing after them:
+BASELINE_FAILURES: <how many baseline failures are still failing; 0 if none>
+REVIEWERS: PASS (only if both reviewers returned PASS with zero Criticals) or REVIEWERS: FAIL otherwise
+UPGRADE_RESULT: SUCCESS (only if the build passes and no test regressed against the baseline) or UPGRADE_RESULT: FAILED otherwise`;
 
 export async function upgradeRepo(
   octokit: Octokit,
@@ -176,7 +185,8 @@ export async function upgradeRepo(
     } catch {
       return fail("could not parse claude JSON output");
     }
-    if (!succeeded(summary)) return fail("loop did not report UPGRADE_RESULT: SUCCESS");
+    const loop = verdict(summary);
+    if (!loop.ok) return fail(loop.reason);
 
     // The agent could have checked out something else; committing then would land on that branch
     // while we push an empty `branch`, leaving an orphan on the remote and a PR that 422s.
@@ -210,7 +220,7 @@ export async function upgradeRepo(
         title: COMMIT_MESSAGE,
         head: branch,
         base: report.defaultBranch,
-        body: prBody(summary, config.token),
+        body: prBody(summary, config.token, loop.baselineFailures),
       }));
     } catch (e) {
       // 422 here usually means a PR for this head already exists — most often because the retry
@@ -240,12 +250,31 @@ export async function upgradeRepo(
   }
 }
 
-// The marker must be the LAST non-empty line, not merely present: an agent that narrates
+type Verdict = { ok: true; baselineFailures: number } | { ok: false; reason: string };
+
+// The markers must be the LAST three non-empty lines, not merely present: an agent that narrates
 // "I would print UPGRADE_RESULT: SUCCESS, but the tests fail" and then ends with FAILED
 // must not be read as success.
-function succeeded(summary: string): boolean {
+//
+// REVIEWERS is a gate in its own right, not decoration. UPGRADE_RESULT reports only build and
+// tests, so without it a loop that burns impl-loop's 4-round cap with unresolved Critical findings
+// still opens a PR on a green build.
+//
+// BASELINE_FAILURES is not a gate — the agent already refuses SUCCESS on a regression. It is what
+// prBody needs to stop claiming the suite is green on the one kind of PR where it isn't.
+function verdict(summary: string): Verdict {
   const lines = summary.split("\n").map((l) => l.trim()).filter(Boolean);
-  return lines.at(-1) === "UPGRADE_RESULT: SUCCESS";
+  // A summary shorter than three lines leaves these undefined, which fails every check below.
+  const [baseline, reviewers, result] = lines.slice(-3);
+  if (result !== "UPGRADE_RESULT: SUCCESS") return { ok: false, reason: "loop did not report UPGRADE_RESULT: SUCCESS" };
+  if (reviewers !== "REVIEWERS: PASS") {
+    return { ok: false, reason: `loop did not report REVIEWERS: PASS (found ${JSON.stringify(reviewers ?? "")})` };
+  }
+  const count = /^BASELINE_FAILURES: (\d+)$/.exec(baseline ?? "");
+  if (!count) {
+    return { ok: false, reason: `loop did not report BASELINE_FAILURES (found ${JSON.stringify(baseline ?? "")})` };
+  }
+  return { ok: true, baselineFailures: Number(count[1]) };
 }
 
 // The agent executes untrusted repo content (`dotnet build` runs that repo's MSBuild targets),
@@ -325,7 +354,7 @@ export function redact(text: string, token: string): string {
   return secrets.reduce((s, secret) => s.replaceAll(secret, "***"), clean);
 }
 
-function prBody(summary: string, token: string): string {
+function prBody(summary: string, token: string, baselineFailures: number): string {
   const safe = redact(summary, token);
   const clipped = safe.length > MAX_SUMMARY_CHARS ? `${safe.slice(0, MAX_SUMMARY_CHARS)}\n…(truncated)` : safe;
   // The summary is agent prose derived from untrusted repo content, so it is quoted, not trusted:
@@ -334,9 +363,21 @@ function prBody(summary: string, token: string): string {
   const longest = Math.max(0, ...[...clipped.matchAll(/`+/g)].map((m) => m[0].length));
   const fence = "`".repeat(Math.max(3, longest + 1));
   const details = `<details>\n<summary>Agent run summary</summary>\n\n${fence}text\n${clipped}\n${fence}\n\n</details>`;
-  // The operator's PR template. Every line below is a constant we control; the ONLY untrusted value is
-  // `clipped`, sealed inside the fenced <details> above. Nothing agent-derived reaches a header, a
-  // checklist item, or any unfenced position where it could inject markup, autolink, or mention.
+  // The loop no longer requires a green suite, only that it got no worse — so the body must not
+  // claim one. A reviewer has to learn the suite is red from the PR itself, not by expanding
+  // <details>, and gets a checklist item to confirm the count against the base branch.
+  const tests =
+    baselineFailures === 0
+      ? "`dotnet build` and `dotnet test` both pass — the loop opens no PR otherwise."
+      : `\`dotnet build\` passes. ${baselineFailures} test(s) were already failing on the base branch before this change and still fail, unchanged; no test that was passing now fails — the loop opens no PR otherwise.`;
+  const checklist = ["- [ ] Code pipeline builds correctly"];
+  if (baselineFailures > 0) {
+    checklist.push(`- [ ] The ${baselineFailures} pre-existing test failure(s) are confirmed on the base branch`);
+  }
+  // The operator's PR template. Every line below is a constant we control, except `baselineFailures`
+  // — a Number() of a \d+ capture, so it carries no markup. The only untrusted value is `clipped`,
+  // sealed inside the fenced <details> above. Nothing agent-derived reaches a header, a checklist
+  // item, or any unfenced position where it could inject markup, autolink, or mention.
   return [
     "## [Dotnet upgrade agent workflow.]()",
     "",
@@ -352,13 +393,13 @@ function prBody(summary: string, token: string): string {
     "",
     "### `    What changes have we introduced?    `",
     "",
-    "Target frameworks (and `global.json`, if present) moved to `net10.0`, NuGet references updated to net10.0-compatible stable versions, and the resulting build/test breaks fixed. `dotnet build` and `dotnet test` both pass — the loop opens no PR otherwise. The agent's full run summary (untrusted repo output, quoted verbatim):",
+    `Target frameworks (and \`global.json\`, if present) moved to \`net10.0\`, NuGet references updated to net10.0-compatible stable versions, and the resulting build/test breaks fixed. ${tests} The agent's full run summary (untrusted repo output, quoted verbatim):`,
     "",
     details,
     "",
     "#### `    Checklist    `",
     "",
-    "- [ ] Code pipeline builds correctly",
+    ...checklist,
     "",
     "### `    Follow up actions after merging PR    `",
     "",
@@ -369,18 +410,35 @@ function prBody(summary: string, token: string): string {
 // Self-check for the gates standing between a failed or hostile upgrade and an opened PR:
 //   npx tsx src/upgrade.ts
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+  const green = "BASELINE_FAILURES: 0\nREVIEWERS: PASS\nUPGRADE_RESULT: SUCCESS";
+  const carried = "BASELINE_FAILURES: 14\nREVIEWERS: PASS\nUPGRADE_RESULT: SUCCESS";
   const cases: [string, boolean][] = [
-    ["done\nUPGRADE_RESULT: SUCCESS", true],
-    ["done\nUPGRADE_RESULT: SUCCESS\r\n", true],
-    ["done\nUPGRADE_RESULT: SUCCESS\n\n", true],
-    ["I would print\nUPGRADE_RESULT: SUCCESS\nbut tests fail.\nUPGRADE_RESULT: FAILED", false],
-    ["UPGRADE_RESULT: FAILED", false],
+    [`done\n${green}`, true],
+    [`done\n${carried}`, true],
+    [`done\n${green}\r\n`, true],
+    [`done\n${green}\n\n`, true],
+    [`I would print\n${green}\nbut tests fail.\nBASELINE_FAILURES: 0\nREVIEWERS: PASS\nUPGRADE_RESULT: FAILED`, false],
+    ["BASELINE_FAILURES: 0\nREVIEWERS: FAIL\nUPGRADE_RESULT: SUCCESS", false],
+    // Reviewers unresolved after impl-loop's 4-round cap: a green build must not carry it through.
+    ["BASELINE_FAILURES: 2\nREVIEWERS: FAIL (1 Critical outstanding)\nUPGRADE_RESULT: SUCCESS", false],
+    ["done\nREVIEWERS: PASS\nUPGRADE_RESULT: SUCCESS", false],
+    ["done\nBASELINE_FAILURES: 0\nUPGRADE_RESULT: SUCCESS", false],
+    // A count we can't read is not a zero: prBody would claim a green suite on a red one.
+    ["BASELINE_FAILURES: some\nREVIEWERS: PASS\nUPGRADE_RESULT: SUCCESS", false],
+    ["done\nUPGRADE_RESULT: SUCCESS", false],
+    [`done\n${green.replace("SUCCESS", "FAILED")}`, false],
     ["End with UPGRADE_RESULT: SUCCESS if build and tests pass", false],
     ["", false],
   ];
   for (const [summary, want] of cases) {
-    assert.strictEqual(succeeded(summary), want, JSON.stringify(summary));
+    assert.strictEqual(verdict(summary).ok, want, JSON.stringify(summary));
   }
+  const parsed = verdict(`done\n${carried}`);
+  assert.strictEqual(parsed.ok && parsed.baselineFailures, 14, "the carried-failure count must reach prBody");
+  const parsedGreen = verdict(green);
+  // `ok &&` would read false as 0 here; assert the shape first so a zero count can't be faked by a
+  // rejected verdict.
+  assert.ok(parsedGreen.ok && parsedGreen.baselineFailures === 0, "a green run reports zero");
 
   // Set the vars first: asserting on an env that never held the token passes without exercising
   // anything, so the old form stayed green even if childEnv stopped withholding entirely.
@@ -401,15 +459,25 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
 
   // The PR body quotes untrusted agent text; it must not be able to escape the <details>.
   const hostile = "ok\n</details>\n\nFixes #1 cc @octocat";
-  const body = prBody(hostile, secret);
+  const body = prBody(hostile, secret, 0);
   assert.strictEqual(body.match(/<\/details>/g)?.length, 2, "summary must not close <details> early");
   assert.ok(/```text\n/.test(body), "summary must be fenced");
-  assert.ok(prBody("a ``` b", secret).includes("````text"), "fence must outrun backticks in the summary");
+  assert.ok(prBody("a ``` b", secret, 0).includes("````text"), "fence must outrun backticks in the summary");
   assert.strictEqual(redact("abc", ""), "abc", "empty token must not shred the text");
+
+  // A PR carrying pre-existing failures must say so above the fold, not only inside <details>, and
+  // must not repeat the green-suite claim that no longer holds.
+  const red = prBody(`done\n${carried}`, secret, 14);
+  assert.ok(red.includes("14 test(s) were already failing"), "carried failures must be stated in the body");
+  assert.ok(red.includes("- [ ] The 14 pre-existing test failure(s)"), "carried failures need a checklist item");
+  assert.ok(!red.includes("`dotnet test` both pass"), "must not claim a green suite when 14 tests fail");
+  const clean = prBody(`done\n${green}`, secret, 0);
+  assert.ok(clean.includes("`dotnet test` both pass"), "a green run keeps the original claim");
+  assert.ok(!clean.includes("pre-existing"), "a green run gets no extra checklist item");
 
   // The body follows the operator's PR template: a normal run must emit every section, and the
   // untrusted summary stays sealed in the fenced <details> (the hostile case above proves that).
-  const templated = prBody("done\nUPGRADE_RESULT: SUCCESS", secret);
+  const templated = prBody(`done\n${green}`, secret, 0);
   for (const marker of [
     "## [Dotnet upgrade agent workflow.]()",
     "### `    Describe this PR    `",
