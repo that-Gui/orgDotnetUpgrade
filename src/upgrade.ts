@@ -282,7 +282,7 @@ function verdict(summary: string): Verdict {
 // name: operators who follow the `gh` route commonly also have GH_TOKEN holding the same secret,
 // and dropping only GITHUB_TOKEN would hand it straight back. Node reuse is off so a timeout kill
 // doesn't leave MSBuild workers writing into the clone we are about to delete.
-// ponytail: same-uid process introspection (/proc/<ppid>/environ) and on-disk credentials
+// same-uid process introspection (/proc/<ppid>/environ) and on-disk credentials
 // (~/.git-credentials, a .env above WORK_DIR) still reach the token — closing those needs a
 // container or a separate uid, which is the real boundary. See README.
 function childEnv(token: string): NodeJS.ProcessEnv {

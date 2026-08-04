@@ -18,7 +18,9 @@ CLI that inventories an organization's GitHub repositories for projects targetin
 flowchart TD
     LIST["repos.listForOrg, paginated"] --> ACTIVE{"active and scannable?"}
     ACTIVE -->|no| SKIP(["skipped: archived, disabled, no default<br/>branch, or last push older than ACTIVE_MONTHS"])
-    ACTIVE -->|yes| READ["getTree, then getContent for up to 30 project files<br/>under 1 MB each: read TargetFramework/TargetFrameworks<br/>plus Directory.Build.props and global.json sdk.version"]
+    ACTIVE -->|yes| OWN{"CODEOWNERS names CODE_OWNERS?<br/>(skipped when CODE_OWNERS=0)"}
+    OWN -->|no| SKIP
+    OWN -->|yes| READ["getTree, then getContent for up to 30 project files<br/>under 1 MB each: read TargetFramework/TargetFrameworks<br/>plus Directory.Build.props and global.json sdk.version"]
     READ --> CLASS["classify"]
     CLASS --> QUEUE["upgradeQueue: keep needs-upgrade,<br/>fewest project files first"]
     QUEUE --> SUB{"subcommand"}
@@ -45,10 +47,23 @@ Both subcommands share the whole scan; only `run` continues past the queue.
 | `GITHUB_ORG` | yes | — | Organization to scan |
 | `GITHUB_TOKEN` | yes | — | Auth for API, clone, and push |
 | `WORK_DIR` | no | `./work` | Clones (`repos/`) and per-repo Claude logs (`logs/`) |
-| `BATCH_SIZE` | no | `3` | Repos upgraded per `run` |
+| `BATCH_SIZE` | no | `4` | Repos upgraded per `run` |
 | `ACTIVE_MONTHS` | no | `12` | Repos pushed within this window count as active |
+| `CODE_OWNERS` | no | `0` | `0` scans the whole org; any other value scans only repos whose `CODEOWNERS` names that owner |
 | `CLAUDE_TIMEOUT_MINUTES` | no | `90` | Per-repo Claude timeout |
 | `LOOP_CONFIG_DIR` | no | unset | Copied into each clone as `.claude/` |
+
+`CODE_OWNERS` scopes a run to one team, so a shared org namespace doesn't mean upgrading someone
+else's repos. It is read from `CODEOWNERS`, `.github/CODEOWNERS` or `docs/CODEOWNERS` on the default
+branch and matched **per owner entry**: comments are ignored, the leading `@` is optional, case does
+not matter, and `@org/backend` does not match the separate team `@org/backend-team`. A repo matches
+if the owner appears on any rule line, not only on `*`. Filtered repos leave the inventory entirely —
+they appear in no bucket and can never reach the upgrade queue — and a repo whose `CODEOWNERS` is
+missing, oversize or unreadable is excluded rather than assumed to be yours.
+
+```sh
+CODE_OWNERS=@my-org/shared-services npm run inventory
+```
 
 ```mermaid
 classDiagram
@@ -58,6 +73,7 @@ classDiagram
         +WORK_DIR
         +BATCH_SIZE
         +ACTIVE_MONTHS
+        +CODE_OWNERS
         +CLAUDE_TIMEOUT_MINUTES
         +LOOP_CONFIG_DIR
     }

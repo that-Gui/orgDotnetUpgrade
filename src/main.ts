@@ -43,6 +43,10 @@ if (!/^[A-Za-z0-9-]+$/.test(org)) {
 }
 const token = requireEnv("GITHUB_TOKEN");
 const activeMonths = numEnv("ACTIVE_MONTHS", 12);
+// "0" and unset both mean no filter: the whole org, as before. Any other value keeps only the repos
+// whose CODEOWNERS names that owner — both in the inventory print and in what `run` upgrades.
+const rawOwner = process.env.CODE_OWNERS?.trim();
+const codeOwner = !rawOwner || rawOwner === "0" ? undefined : rawOwner;
 
 // A full-org scan is one getTree plus up to 30 getContent per repo, so a few hundred repos will
 // trip GitHub's secondary rate limit. Without these plugins the 403 propagates out of
@@ -64,7 +68,7 @@ const octokit = new ThrottledOctokit({
 });
 
 async function main(): Promise<number> {
-  const reports = await buildInventory(octokit, { org, activeMonths });
+  const reports = await buildInventory(octokit, { org, activeMonths, codeOwner });
   const queue = upgradeQueue(reports);
 
   if (sub === "inventory") {
@@ -91,7 +95,7 @@ async function main(): Promise<number> {
     timeoutMinutes: numEnv("CLAUDE_TIMEOUT_MINUTES", 90),
     loopConfigDir: process.env.LOOP_CONFIG_DIR,
   };
-  const batch = queue.slice(0, numEnv("BATCH_SIZE", 3));
+  const batch = queue.slice(0, numEnv("BATCH_SIZE", 4));
   let ok = 0;
   for (const r of batch) {
     console.log(`upgrading ${r.name}...`);
